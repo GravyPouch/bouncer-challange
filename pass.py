@@ -100,6 +100,18 @@ def bouncer_decision_loop(base_url, game_id, num_requests=20, delay=1, model_pat
                 print(f"📊 SUMMARY: Admitted: {admitted} | Rejected: {rejected} | Total: {total_encounters} | AccRate: {acc_rate:.3f} | Current Person: {current_person_index}")
                 print(f"System Status: {status}")
 
+                # Adaptive policy threshold controller to keep acceptance within [0.40, 0.75]
+                if not hasattr(bouncer_decision_loop, "policy_tau"):
+                    bouncer_decision_loop.policy_tau = 0.5
+                tau = bouncer_decision_loop.policy_tau
+                if total_encounters >= 10:  # wait a bit before controlling
+                    if acc_rate > 0.75:
+                        tau = min(0.999, tau + 0.05)
+                    elif acc_rate < 0.40:
+                        tau = max(0.05, tau - 0.05)
+                bouncer_decision_loop.policy_tau = tau
+                print(f"  Controller threshold tau={tau:.3f}")
+
                 # Stop if game is completed/failed or encounter cap reached
                 if status in ("completed", "failed"):
                     print(f"Game status '{status}' reached. Stopping loop.")
@@ -140,7 +152,7 @@ def bouncer_decision_loop(base_url, game_id, num_requests=20, delay=1, model_pat
                         bouncer_decision_loop.accepted_by_attr = {a: 0 for a in (attribute_ids or [])}
                     accepted_by_attr = bouncer_decision_loop.accepted_by_attr
 
-                    # Feasibility-aware guard (less conservative): use max required, not sum
+                    # Feasibility-aware guard: ensure we keep enough slots to meet minima
                     if True:
                         forced_reject = False
                         if min_counts and attribute_ids:
@@ -153,43 +165,63 @@ def bouncer_decision_loop(base_url, game_id, num_requests=20, delay=1, model_pat
                             min_slots_required = max(needed_after_accept) if needed_after_accept else 0
                             if min_slots_required > potential_slots_after:
                                 forced_reject = True
-
-                        # If there are outstanding deficits, only accept candidates who help at least one deficit
-                        helps_deficit = True
-                        if min_counts and attribute_ids:
-                            deficits_exist = False
-                            helps_deficit = False
-                            for a in attribute_ids:
-                                need = max(0, min_counts.get(a, 0) - accepted_by_attr.get(a, 0))
-                                if need > 0:
-                                    deficits_exist = True
-                                    if attributes.get(a, False):
-                                        helps_deficit = True
-                            if deficits_exist and not helps_deficit:
+                            # Hard capacity safety: never accept when no slots remain
+                            if slots_remaining <= 0:
                                 forced_reject = True
 
                         if forced_reject:
                             accept_decision = False
                             print("  → Forced REJECT to preserve feasibility of constraints (guard)")
                         else:
-                            # Decision logic (policy or fallback)
-                            if policy_model is not None and attribute_ids is not None:
-                                accept_decision = policy_decide(policy_model, attributes, attribute_ids, threshold=0.5)
-                                print(f"  → Decision from policy: {'ACCEPT' if accept_decision else 'REJECT'}")
+                            # If all quotas satisfied, accept to fill remaining capacity
+                            quotas_met = True
+                            if min_counts and attribute_ids:
+                                for a in attribute_ids:
+                                    if accepted_by_attr.get(a, 0) < min_counts.get(a, 0):
+                                        quotas_met = False
+                                        break
+                            if quotas_met:
+                                accept_decision = True
+                                print("  → Decision: ACCEPT (all quotas met; filling capacity)")
                             else:
-                                # Simple inventory-balancing fallback: accept if any required attr present
-                                need_any = False
-                                if min_counts and attribute_ids:
+                                # If acceptance is too high, reject non-helpful candidates to conserve capacity
+                                if acc_rate > 0.75 and min_counts and attribute_ids:
+                                    helps_any_deficit = False
                                     for a in attribute_ids:
                                         if accepted_by_attr.get(a, 0) < min_counts.get(a, 0) and attributes.get(a, False):
-                                            need_any = True
+                                            helps_any_deficit = True
                                             break
-                                if need_any:
-                                    accept_decision = True
-                                    print("  → Decision: ACCEPT (fallback, attribute still under quota)")
+                                    if not helps_any_deficit:
+                                        accept_decision = False
+                                        print("  → Decision: REJECT (acc_rate>0.75 and candidate non-helpful)")
+                                        # Skip model decision
+                                        goto_model_decision = False
+                                    else:
+                                        goto_model_decision = True
                                 else:
-                                    accept_decision = False
-                                    print("  → Decision: REJECT (fallback)")
+                                    goto_model_decision = True
+
+                                # Otherwise, use model with adaptive threshold; if not, heuristic fallback
+                                if policy_model is not None and attribute_ids is not None:
+                                    # Deficit-aware boost: lower threshold slightly if candidate helps any deficit
+                                    threshold_boost = 0.0
+                                    if min_counts and attribute_ids:
+                                        for a in attribute_ids:
+                                            if accepted_by_attr.get(a, 0) < min_counts.get(a, 0) and attributes.get(a, False):
+                                                threshold_boost = -0.05
+                                                break
+                                    dyn_threshold = max(0.05, min(0.999, bouncer_decision_loop.policy_tau + threshold_boost))
+                                    if goto_model_decision:
+                                        accept_decision = policy_decide(policy_model, attributes, attribute_ids, threshold=dyn_threshold)
+                                    print(f"  → Decision from policy: {'ACCEPT' if accept_decision else 'REJECT'}")
+                                else:
+                                    # Simple heuristic: accept if acceptance below lower bound, otherwise reject
+                                    if acc_rate < 0.40:
+                                        accept_decision = True
+                                        print("  → Decision: ACCEPT (fallback, rate below lower bound)")
+                                    else:
+                                        accept_decision = False
+                                        print("  → Decision: REJECT (fallback)")
 
                     # Update accepted-by-attribute counts if we decided to accept
                     if accept_decision and attribute_ids:

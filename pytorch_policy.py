@@ -83,13 +83,9 @@ def train_policy(config: ScenarioConfig,
     lambdas = {a: 0.0 for a in config.attribute_ids}
     min_counts_tensor = torch.tensor([config.min_counts.get(a, 0) for a in config.attribute_ids]).float()
 
-    # Heuristic target accept rate based on constraints and marginals
-    targets = []
-    for a in config.attribute_ids:
-        fk = max(1e-4, float(config.rel_freq.get(a, 0.1)))
-        mk = float(config.min_counts.get(a, 0))
-        targets.append(mk / (config.capacity * fk))
-    target_accept_rate = float(min(0.75, max(0.1, max(targets) if targets else 0.2)))
+    # Acceptance rate box [0.40, 0.75]
+    acceptance_lower_bound = 0.40
+    acceptance_upper_bound = 0.75
 
     for _ in range(steps):
         x = bernoulli_copula_sample(batch_size, config.rel_freq, config.correlations, config.attribute_ids)
@@ -99,9 +95,11 @@ def train_policy(config: ScenarioConfig,
         accepted_by_attr = (p.unsqueeze(1) * x).mean(dim=0) * config.capacity
 
         violations = torch.clamp(min_counts_tensor - accepted_by_attr, min=0.0)
-        # Strongly enforce acceptance near target using squared penalty (removes bias to p=1)
+        # Enforce acceptance rate box via hinge-squared penalties
         p_mean = p.mean()
-        accept_rate_penalty = (p_mean - target_accept_rate) ** 2
+        over = torch.clamp(p_mean - acceptance_upper_bound, min=0.0)
+        under = torch.clamp(acceptance_lower_bound - p_mean, min=0.0)
+        accept_rate_penalty = over.pow(2) + under.pow(2)
         # Encourage high entropy to avoid p near 0/1
         eps = 1e-6
         entropy = -(p * torch.log(p + eps) + (1 - p) * torch.log(1 - p + eps)).mean()
@@ -119,7 +117,7 @@ def train_policy(config: ScenarioConfig,
 
         loss = (
             constraint_penalty
-            + 3.0 * accept_rate_penalty
+            + 5.0 * accept_rate_penalty
             + 0.02 * (margin_up.mean() + margin_down.mean())
             - 0.01 * entropy
         )
@@ -170,14 +168,9 @@ def train_bidprice_policy(config: ScenarioConfig,
     lambdas = {a: 0.0 for a in config.attribute_ids}
     min_counts_tensor = torch.tensor([config.min_counts.get(a, 0) for a in config.attribute_ids]).float()
 
-    # Feasible target accept rate lower bound based on marginal frequencies
-    targets = []
-    for a in config.attribute_ids:
-        fk = max(1e-4, float(config.rel_freq.get(a, 0.1)))
-        mk = float(config.min_counts.get(a, 0))
-        targets.append(mk / (config.capacity * fk))
-    # Encourage a slightly higher accept rate to add buffer against variance
-    target_accept_rate = float(min(0.8, max(0.15, 1.05 * max(targets) if targets else 0.25)))
+    # Acceptance rate box [0.40, 0.75]
+    acceptance_lower_bound = 0.40
+    acceptance_upper_bound = 0.75
 
     for _ in range(steps):
         x = bernoulli_copula_sample(batch_size, config.rel_freq, config.correlations, config.attribute_ids)
@@ -187,13 +180,15 @@ def train_bidprice_policy(config: ScenarioConfig,
         accepted_by_attr = (p.unsqueeze(1) * x).mean(dim=0) * config.capacity
 
         # Slack-aware violations: add small buffer to fight variance in online fill
-        buffer = 0.02 * config.capacity
+        buffer = 0.005 * config.capacity
+        buffer = 0.005 * config.capacity
         violations = torch.clamp((min_counts_tensor + buffer) - accepted_by_attr, min=0.0)
 
-        # Objectives and regularizers
-        # Strong squared penalty to keep mean acceptance near target
+        # Objectives and regularizers: box constraints on acceptance rate
         p_mean = p.mean()
-        accept_rate_penalty = (p_mean - target_accept_rate) ** 2
+        over = torch.clamp(p_mean - acceptance_upper_bound, min=0.0)
+        under = torch.clamp(acceptance_lower_bound - p_mean, min=0.0)
+        accept_rate_penalty = over.pow(2) + under.pow(2)
         eps = 1e-6
         entropy = -(p * torch.log(p + eps) + (1 - p) * torch.log(1 - p + eps)).mean()
 
@@ -202,7 +197,7 @@ def train_bidprice_policy(config: ScenarioConfig,
 
         loss = (
             constraint_penalty
-            + 2.5 * accept_rate_penalty
+            + 4.0 * accept_rate_penalty
             - 0.01 * entropy
         )
 
