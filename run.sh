@@ -1,0 +1,1 @@
+python3 new_game.py --scenario 1 --player 6f1a536c-0a45-43c1-acbe-f5d62094ed1c --steps 2000 --batch 4096 --lr 5e-4 --model policy.pt --requests 1200 --delay 0.01 --cap 20000
